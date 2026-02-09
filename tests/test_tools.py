@@ -3,9 +3,9 @@
 import json
 import pytest
 from pathlib import Path
-from unittest.mock import MagicMock, patch, AsyncMock
+from unittest.mock import patch
 
-from mcp_server_synapse.utils import validate_project_path, ensure_initialized, format_error
+from mcp_server_synapse.utils import validate_project_path, format_error
 from mcp_server_synapse.synapse_wrapper import SynapseWrapper
 
 
@@ -24,16 +24,20 @@ class TestUtils:
         with pytest.raises(ValueError, match="not a directory"):
             validate_project_path(str(f))
 
-    def test_ensure_initialized_true(self, tmp_path):
-        (tmp_path / ".synapse").mkdir()
-        assert ensure_initialized(str(tmp_path)) is True
-
-    def test_ensure_initialized_false(self, tmp_path):
-        assert ensure_initialized(str(tmp_path)) is False
-
-    def test_format_error(self):
-        result = json.loads(format_error("test error"))
+    def test_format_error_basic(self):
+        raw = format_error("test error")
+        assert "  " not in raw  # compact JSON, no indentation
+        result = json.loads(raw)
         assert result == {"error": "test error"}
+
+    def test_format_error_with_hint(self):
+        raw = format_error("test error", hint="do this")
+        result = json.loads(raw)
+        assert result == {"error": "test error", "hint": "do this"}
+
+    def test_format_error_without_hint(self):
+        result = json.loads(format_error("test error"))
+        assert "hint" not in result
 
 
 class TestSynapseWrapper:
@@ -43,73 +47,188 @@ class TestSynapseWrapper:
         yield w
         w._executor.shutdown(wait=False)
 
-    @pytest.mark.asyncio
-    async def test_init_project(self, wrapper, tmp_path):
-        result = await wrapper.init_project(str(tmp_path))
-        assert result["success"] is True
-        assert (tmp_path / ".synapse").is_dir()
-        assert (tmp_path / ".context").is_dir()
-        assert (tmp_path / ".agent").is_dir()
+    # --- index ---
 
     @pytest.mark.asyncio
-    async def test_init_project_already_initialized(self, wrapper, tmp_path):
+    async def test_index_auto_init(self, wrapper, tmp_path):
+        """Index should auto-create .synapse/ on first run."""
+        with patch.object(wrapper, "_run_sync") as mock_run:
+            mock_run.return_value = {
+                "status": "success",
+                "files_analyzed": 10,
+                "graph_nodes": 5,
+                "graph_edges": 3,
+                "is_fresh_index": True,
+            }
+            result = await wrapper.index(str(tmp_path))
+            assert result["is_fresh_index"] is True
+
+    @pytest.mark.asyncio
+    async def test_index_incremental(self, wrapper, tmp_path):
+        """Index on already-initialized project does incremental."""
         (tmp_path / ".synapse").mkdir()
         (tmp_path / ".synapse" / "db").mkdir()
-        (tmp_path / ".context").mkdir()
-        (tmp_path / ".agent").mkdir()
-        result = await wrapper.init_project(str(tmp_path))
-        assert result["success"] is True
-        assert "already initialized" in result["message"]
+        with patch.object(wrapper, "_run_sync") as mock_run:
+            mock_run.return_value = {
+                "status": "success",
+                "files_analyzed": 2,
+                "graph_nodes": 5,
+                "graph_edges": 3,
+                "is_fresh_index": False,
+            }
+            result = await wrapper.index(str(tmp_path))
+            assert result["is_fresh_index"] is False
 
     @pytest.mark.asyncio
-    async def test_init_project_invalid_path(self, wrapper):
+    async def test_index_invalid_path(self, wrapper):
         with pytest.raises(ValueError):
-            await wrapper.init_project("/nonexistent/path")
+            await wrapper.index("/nonexistent/path")
+
+    # --- search ---
 
     @pytest.mark.asyncio
-    async def test_analyze_not_initialized(self, wrapper, tmp_path):
-        result = await wrapper.analyze(str(tmp_path))
-        assert "error" in result
-
-    @pytest.mark.asyncio
-    async def test_search_not_initialized(self, wrapper, tmp_path):
+    async def test_search_not_indexed(self, wrapper, tmp_path):
         result = await wrapper.search("test query", str(tmp_path))
         assert "error" in result
+        assert "hint" in result
 
     @pytest.mark.asyncio
-    async def test_context_not_initialized(self, wrapper, tmp_path):
+    async def test_search_returns_results(self, wrapper, tmp_path):
+        (tmp_path / ".synapse").mkdir()
+        with patch.object(wrapper, "_run_sync") as mock_run:
+            mock_run.return_value = {
+                "query": "test",
+                "results": [
+                    {"file": "a.py", "score": 0.9, "snippet": "code..."},
+                ],
+                "count": 1,
+            }
+            result = await wrapper.search("test", str(tmp_path))
+            assert result["count"] == 1
+            assert result["results"][0]["file"] == "a.py"
+
+    @pytest.mark.asyncio
+    async def test_search_include_context(self, wrapper, tmp_path):
+        (tmp_path / ".synapse").mkdir()
+        with patch.object(wrapper, "_run_sync") as mock_run:
+            mock_run.return_value = {
+                "query": "test",
+                "results": [
+                    {
+                        "file": "a.py",
+                        "score": 0.9,
+                        "snippet": "code...",
+                        "dependencies": ["b.py", "c.py"],
+                    },
+                ],
+                "count": 1,
+            }
+            result = await wrapper.search(
+                "test", str(tmp_path), include_context=True
+            )
+            assert "dependencies" in result["results"][0]
+
+    # --- context ---
+
+    @pytest.mark.asyncio
+    async def test_context_not_indexed(self, wrapper, tmp_path):
         result = await wrapper.get_context("file.py", str(tmp_path))
         assert "error" in result
+        assert "hint" in result
 
     @pytest.mark.asyncio
-    async def test_graph_not_initialized(self, wrapper, tmp_path):
-        result = await wrapper.get_graph("file.py", str(tmp_path))
-        assert "error" in result
-
-    @pytest.mark.asyncio
-    async def test_skeletonize_file_not_found(self, wrapper):
-        result = await wrapper.skeletonize("/nonexistent/file.py")
-        assert "error" in result
-
-    @pytest.mark.asyncio
-    async def test_ask_not_initialized(self, wrapper, tmp_path):
-        result = await wrapper.ask("question", str(tmp_path))
-        assert "error" in result
-
-    @pytest.mark.asyncio
-    async def test_watch_not_initialized(self, wrapper, tmp_path):
-        result = await wrapper.watch("status", str(tmp_path))
-        assert "error" in result
-
-    @pytest.mark.asyncio
-    async def test_watch_invalid_action(self, wrapper, tmp_path):
+    async def test_context_returns_references(self, wrapper, tmp_path):
         (tmp_path / ".synapse").mkdir()
-        with patch("mcp_server_synapse.synapse_wrapper.SynapseWrapper._run_sync") as mock_run:
-            mock_run.return_value = {"error": "Unknown action: invalid. Use start/stop/status."}
-            result = await wrapper.watch("invalid", str(tmp_path))
-            assert "error" in result
+        with patch.object(wrapper, "_run_sync") as mock_run:
+            mock_run.return_value = {
+                "target_file": "file.py",
+                "references": [
+                    {"file": "dep.py", "skeleton": "class Foo: ..."},
+                ],
+                "reference_count": 1,
+            }
+            result = await wrapper.get_context("file.py", str(tmp_path))
+            assert result["reference_count"] == 1
+            assert result["references"][0]["file"] == "dep.py"
+
+    # --- overview ---
+
+    @pytest.mark.asyncio
+    async def test_overview_not_indexed(self, wrapper, tmp_path):
+        result = await wrapper.overview(str(tmp_path))
+        assert "error" in result
+        assert "hint" in result
+
+    @pytest.mark.asyncio
+    async def test_overview_returns_data(self, wrapper, tmp_path):
+        (tmp_path / ".synapse").mkdir()
+        with patch.object(wrapper, "_run_sync") as mock_run:
+            mock_run.return_value = {
+                "project_path": str(tmp_path),
+                "intelligence": "# Architecture\n...",
+                "indexed_files": 10,
+                "graph_nodes": 5,
+                "graph_edges": 3,
+                "file_tree": "src/\n  main.py",
+            }
+            result = await wrapper.overview(str(tmp_path))
+            assert result["intelligence"] is not None
+            assert result["indexed_files"] == 10
+            assert "file_tree" in result
+
+    @pytest.mark.asyncio
+    async def test_overview_no_intelligence(self, wrapper, tmp_path):
+        (tmp_path / ".synapse").mkdir()
+        with patch.object(wrapper, "_run_sync") as mock_run:
+            mock_run.return_value = {
+                "project_path": str(tmp_path),
+                "intelligence": None,
+                "file_tree": "",
+            }
+            result = await wrapper.overview(str(tmp_path))
+            assert result["intelligence"] is None
+
+    # --- cleanup ---
 
     @pytest.mark.asyncio
     async def test_cleanup(self, wrapper):
         await wrapper.cleanup()
         assert len(wrapper._cache) == 0
+
+
+class TestFileTree:
+    def test_build_file_tree(self, tmp_path):
+        (tmp_path / "src").mkdir()
+        (tmp_path / "src" / "main.py").write_text("print('hi')")
+        (tmp_path / "README.md").write_text("# Hello")
+
+        wrapper = SynapseWrapper()
+        tree = wrapper._build_file_tree(tmp_path, max_depth=3)
+        assert "src/" in tree
+        assert "main.py" in tree
+        assert "README.md" in tree
+        wrapper._executor.shutdown(wait=False)
+
+    def test_build_file_tree_skips_hidden(self, tmp_path):
+        (tmp_path / ".git").mkdir()
+        (tmp_path / "__pycache__").mkdir()
+        (tmp_path / "real.py").write_text("x = 1")
+
+        wrapper = SynapseWrapper()
+        tree = wrapper._build_file_tree(tmp_path, max_depth=3)
+        assert ".git" not in tree
+        assert "__pycache__" not in tree
+        assert "real.py" in tree
+        wrapper._executor.shutdown(wait=False)
+
+    def test_build_file_tree_max_depth(self, tmp_path):
+        (tmp_path / "a" / "b" / "c" / "d").mkdir(parents=True)
+        (tmp_path / "a" / "b" / "c" / "d" / "deep.py").write_text("x")
+
+        wrapper = SynapseWrapper()
+        tree = wrapper._build_file_tree(tmp_path, max_depth=2)
+        assert "a/" in tree
+        assert "b/" in tree
+        # depth 2 means we see a/ and b/ but not c/
+        assert "deep.py" not in tree
+        wrapper._executor.shutdown(wait=False)

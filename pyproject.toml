@@ -1,6 +1,6 @@
 [project]
 name = "mcp-server-synapse"
-version = "0.1.0"
+version = "0.2.1"
 description = "MCP server for synapse-ai-context"
 requires-python = ">=3.10,<3.13"
 dependencies = [

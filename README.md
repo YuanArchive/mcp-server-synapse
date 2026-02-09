@@ -1,27 +1,32 @@
 # mcp-server-synapse
 
-**Give your AI agent deep understanding of any codebase.**
+**Semantic code intelligence for Claude Code.**
 
-[![MCP Server](https://badge.mcpx.dev?type=server&features=tools,resources)](https://modelcontextprotocol.io)
-[![Python](https://img.shields.io/badge/Python-3.12-blue)](https://python.org)
+[![MCP Server](https://badge.mcpx.dev?type=server&features=tools)](https://modelcontextprotocol.io)
+[![Python](https://img.shields.io/badge/Python-3.10--3.12-blue)](https://python.org)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green)](LICENSE)
 
 An MCP server that bridges [synapse-ai-context](https://github.com/YuanArchive/synapse-ai-context)
-with AI coding assistants — enabling semantic search, dependency graphs,
-AST skeletons, and hierarchical context building through natural language.
+with Claude Code — providing capabilities that complement its built-in tools:
+semantic search, dependency graph traversal, and auto-generated architecture docs.
 
-## What is this?
+---
 
-[synapse-ai-context](https://github.com/YuanArchive/synapse-ai-context) is a code intelligence engine that indexes codebases using embeddings, dependency graphs, and AST analysis. This MCP server wraps its Python API so any MCP-compatible AI client (Claude Code, Cursor, Windsurf, etc.) can use it as a tool — no CLI needed.
+## Why?
 
-## Features
+Claude Code already has excellent built-in tools (Grep, Glob, Read) for keyword-based
+search and file reading. This server focuses on what those tools **can't** do:
 
-- **Semantic Search** — Find relevant code using vector similarity + dependency graph
-- **Hierarchical Context** — 3-layer context: architecture overview → skeletons → full source
-- **Dependency Graph** — Visualize import relationships and call chains
-- **AST Skeleton** — Strip implementation, keep structure (50%+ token reduction)
-- **Incremental Indexing** — Only re-index changed files
-- **Apple Silicon Optimized** — Metal (MPS) GPU acceleration for embeddings
+| Capability | Built-in | Synapse |
+|:-----------|:--------:|:-------:|
+| Exact keyword/regex search | Grep | - |
+| Find code by **meaning** | - | `synapse_search` |
+| Read a specific file | Read | - |
+| See a file's **dependency tree** as skeletons | - | `synapse_context` |
+| Understand **project architecture** | - | `synapse_overview` |
+| Auto-generate **INTELLIGENCE.md** | - | `synapse_index` |
+
+---
 
 ## Quick Start
 
@@ -36,54 +41,100 @@ uv sync
 ### 2. Register with Claude Code
 
 ```bash
-claude mcp add synapse -- uv run --directory /path/to/mcp-server-synapse mcp-server-synapse
+claude mcp add synapse -- \
+  uv run --directory /path/to/mcp-server-synapse mcp-server-synapse
 ```
 
 ### 3. Use
 
-Ask your AI assistant to analyze a project:
+> "Use synapse to index this project and find code related to authentication."
 
-> "Use synapse to analyze this project and find code related to authentication."
+That's it. Claude Code will automatically call the right tools.
 
-The server will initialize the project, build indexes, and search through the codebase semantically.
+---
 
 ## Tools
 
-| Tool | Description | Key Parameters |
-|------|-------------|----------------|
-| `synapse_init` | Initialize a synapse project (creates `.synapse/`, `.context/`, `.agent/` dirs) | `project_path` |
-| `synapse_analyze` | Index the codebase — builds embeddings and dependency graph | `project_path`, `full` (bool) |
-| `synapse_search` | Semantic/hybrid search over the codebase | `query`, `project_path`, `hybrid`, `limit` |
-| `synapse_context` | Build hierarchical 3-layer context for a file | `file_path`, `project_path`, `depth`, `max_files` |
-| `synapse_graph` | Get dependency relationships for a file | `file_path`, `project_path` |
-| `synapse_skeleton` | Convert a file to its AST skeleton (signatures + structure only) | `file_path` |
-| `synapse_ask` | Generate an AI prompt enriched with relevant codebase context | `query`, `project_path`, `think` |
-| `synapse_watch` | Manage file watcher for automatic incremental indexing | `action` (start/stop/status), `project_path` |
+4 tools, designed to minimize token usage while maximizing information density.
 
-## Resources
+### `synapse_index`
 
-| URI | Description |
-|-----|-------------|
-| `synapse://{project_path}/intelligence` | Read the generated `INTELLIGENCE.md` architecture document |
-| `synapse://{project_path}/stats` | Get index statistics (file count, graph nodes/edges) |
+Index codebase for semantic search. Auto-initializes on first run, generates INTELLIGENCE.md.
+
+```
+project_path  (str)  — Absolute path to the project
+full          (bool) — Force full reindex (default: false, incremental)
+```
+
+### `synapse_search`
+
+Semantic code search by meaning — vector + dependency graph hybrid.
+
+```
+query           (str)  — Natural language description
+project_path    (str)  — Absolute path to the project
+limit           (int)  — Max results (default: 5)
+include_context (bool) — Include dependency info per result (default: false)
+```
+
+### `synapse_overview`
+
+Project architecture: INTELLIGENCE.md + index stats + file tree.
+
+```
+project_path  (str)  — Absolute path to the project
+```
+
+### `synapse_context`
+
+Skeleton interfaces of files related to target via dependency graph.
+
+```
+file_path     (str) — Target file path
+project_path  (str) — Absolute path to the project
+depth         (int) — BFS traversal depth (default: 2)
+max_files     (int) — Max related files (default: 10)
+```
+
+---
 
 ## Architecture
 
 ```
 ┌─────────────┐    MCP (stdio)    ┌────────────────────┐    Python API    ┌─────────────────────┐
-│  AI Client  │ ◄───────────────► │ mcp-server-synapse │ ◄─────────────► │ synapse-ai-context  │
-│ (Claude, …) │                   │   (FastMCP Server)  │                 │   (Core Engine)     │
+│ Claude Code  │ ◄───────────────► │ mcp-server-synapse │ ◄─────────────► │ synapse-ai-context  │
+│             │                   │   (FastMCP Server)  │                 │   (Core Engine)     │
 └─────────────┘                   └────────────────────┘                  └─────────────────────┘
                                          │
-                                         ├── server.py         → Tool & resource definitions
+                                         ├── server.py          → 4 tool definitions
                                          ├── synapse_wrapper.py → Async wrapper (ThreadPoolExecutor)
-                                         └── utils.py          → Path validation, error handling
+                                         └── utils.py           → Path validation, error handling
 ```
+
+### Token Optimization (v0.2.1)
+
+Every MCP tool response consumes Claude's context window. v0.2.1 is designed to minimize this:
+
+- **Compact JSON** — No indentation, minimal separators (~25% smaller)
+- **Short descriptions** — Tool descriptions cut from ~275 to ~125 tokens
+- **Smaller defaults** — Search limit 10 → 5, snippet 800 → 400 chars, max_files 15 → 10
+- **No redundant fields** — Removed `relation_type`, `included_files`, compacted `savings`
+- **INTELLIGENCE.md truncation** — Capped at 4,000 chars to prevent context overflow
+
+Measured on a real 18-file project:
+
+| Tool | v0.2.0 | v0.2.1 | Reduction |
+|:-----|-------:|-------:|----------:|
+| `synapse_search` | ~1,500 tok | ~660 tok | **56%** |
+| Tool descriptions (per request) | ~275 tok | ~125 tok | **55%** |
+| Overall | — | — | **~31%** |
+
+---
 
 ## Configuration
 
 | Variable | Default | Description |
-|----------|---------|-------------|
+|:---------|:--------|:------------|
 | `SYNAPSE_BATCH_SIZE` | `6` | ChromaDB upsert batch size |
 | `SYNAPSE_MAX_DOC_CHARS` | `8000` | Max document characters for embedding |
 

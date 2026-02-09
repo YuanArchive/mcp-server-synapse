@@ -15,14 +15,12 @@ def validate_project_path(path: str) -> Path:
     return p
 
 
-def ensure_initialized(path: str) -> bool:
-    """Check if .synapse/ directory exists."""
-    return (Path(path).resolve() / ".synapse").is_dir()
-
-
-def format_error(message: str) -> str:
-    """Format error message as JSON string."""
-    return json.dumps({"error": message}, ensure_ascii=False)
+def format_error(message: str, hint: str | None = None) -> str:
+    """Format error message as JSON string, with optional hint."""
+    data = {"error": message}
+    if hint:
+        data["hint"] = hint
+    return json.dumps(data, ensure_ascii=False, separators=(",", ":"))
 
 
 def synapse_error_handler(func):
@@ -38,14 +36,15 @@ def synapse_error_handler(func):
             return format_error(f"File not found: {e}")
         except Exception as e:
             error_type = type(e).__name__
-            # Map synapse-specific exceptions
             if "NotInitialized" in error_type or "ProjectNotInitialized" in error_type:
                 return format_error(
-                    "Project not initialized. Run synapse_init first."
+                    "Project not initialized.",
+                    hint="Run synapse_index first.",
                 )
             if "IndexNotFound" in error_type:
                 return format_error(
-                    "Index not found. Run synapse_analyze first."
+                    "Index not found.",
+                    hint="Run synapse_index first.",
                 )
             if "ParseError" in error_type:
                 return format_error(f"Code parsing failed: {e}")

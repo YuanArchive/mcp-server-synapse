@@ -1,11 +1,12 @@
 """Async wrapper around synapse-ai-context modules."""
 
 import asyncio
+import json as json_mod
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 
-from .utils import ensure_initialized, validate_project_path
+from .utils import validate_project_path
 
 
 @dataclass
@@ -61,97 +62,122 @@ class SynapseWrapper:
             if graph_path.exists():
                 project.code_graph.load()
 
-    async def init_project(self, path: str) -> dict:
-        """Initialize .synapse/, .context/, .agent/ directories."""
+    def _ensure_initialized(self, project_path: Path) -> bool:
+        """Initialize .synapse/ if not present. Returns True if freshly created."""
+        synapse_dir = project_path / ".synapse"
+        if synapse_dir.is_dir():
+            return False
+        synapse_dir.mkdir(parents=True)
+        (synapse_dir / "db").mkdir()
+        (project_path / ".context").mkdir(exist_ok=True)
+        (project_path / ".agent").mkdir(exist_ok=True)
+        return True
+
+    async def index(self, path: str, full: bool = False) -> dict:
+        """Initialize (if needed) and index the codebase.
+
+        Auto-creates .synapse/ directories on first run.
+        Generates INTELLIGENCE.md after analysis.
+        """
         project_path = validate_project_path(path)
-
-        def _init():
-            synapse_dir = project_path / ".synapse"
-            context_dir = project_path / ".context"
-            agent_dir = project_path / ".agent"
-
-            created = []
-            for d in [synapse_dir, context_dir, agent_dir]:
-                if not d.exists():
-                    d.mkdir(parents=True)
-                    created.append(str(d.relative_to(project_path)))
-
-            # Create db subdirectory
-            db_dir = synapse_dir / "db"
-            if not db_dir.exists():
-                db_dir.mkdir()
-
-            return {
-                "success": True,
-                "project_path": str(project_path),
-                "created_directories": created,
-                "message": (
-                    f"Initialized synapse project at {project_path}"
-                    if created
-                    else "Project already initialized"
-                ),
-            }
-
-        return await self._run_sync(_init)
-
-    async def analyze(self, path: str, full: bool = False) -> dict:
-        """Run codebase indexing (incremental or full)."""
-        project_path = validate_project_path(path)
-        if not ensure_initialized(path):
-            return {
-                "error": "Project not initialized. Run synapse_init first."
-            }
-
         project = self._get_or_create(str(project_path))
 
-        def _analyze():
-            if full:
+        def _index():
+            is_fresh = self._ensure_initialized(project_path)
+
+            if full or is_fresh:
                 result = project.analyzer.analyze(json_output=True)
             else:
                 result = project.analyzer.analyze_incremental(json_output=True)
+
             # Invalidate cached stores after re-indexing
             project.vector_store = None
             project.code_graph = None
-            return result
 
-        return await self._run_sync(_analyze)
+            # Generate INTELLIGENCE.md
+            try:
+                self._load_stores(project)
+                if project.code_graph and hasattr(project.code_graph, "graph"):
+                    from synapse.markdown_gen import MarkdownGenerator
+
+                    # Build analysis summary from context.json if available
+                    context_path = project_path / ".synapse" / "context.json"
+                    analysis_summary = {}
+                    if context_path.exists():
+                        analysis_summary = json_mod.loads(
+                            context_path.read_text()
+                        )
+
+                    gen = MarkdownGenerator(
+                        project_path,
+                        analysis_summary,
+                        project.code_graph.graph,
+                    )
+                    intel_content = gen.generate()
+                    intel_path = project_path / ".context" / "INTELLIGENCE.md"
+                    intel_path.parent.mkdir(parents=True, exist_ok=True)
+                    intel_path.write_text(intel_content)
+            except Exception:
+                pass  # INTELLIGENCE.md generation is best-effort
+
+            # Build response
+            output = {
+                "status": result.get("status", "success"),
+                "files_analyzed": result.get(
+                    "files_analyzed", result.get("changed_files", 0)
+                ),
+                "graph_nodes": result.get("graph_nodes", 0),
+                "graph_edges": result.get("graph_edges", 0),
+                "is_fresh_index": is_fresh,
+            }
+            return output
+
+        return await self._run_sync(_index)
 
     async def search(
         self,
         query: str,
         path: str,
-        hybrid: bool = True,
-        limit: int = 10,
+        limit: int = 5,
+        include_context: bool = False,
     ) -> dict:
-        """Semantic or hybrid search over the codebase."""
+        """Hybrid semantic search over the codebase.
+
+        Always uses vector + graph hybrid search when graph is available.
+        Optionally includes dependency info per result.
+        """
         project_path = validate_project_path(path)
-        if not ensure_initialized(path):
+        if not (project_path / ".synapse").is_dir():
             return {
-                "error": "Project not initialized. Run synapse_init first."
+                "error": "Project not indexed.",
+                "hint": "Run synapse_index first.",
             }
 
         project = self._get_or_create(str(project_path))
 
         def _search():
             self._load_stores(project)
-            if hybrid and project.code_graph is not None:
+
+            if project.code_graph is not None:
                 from synapse.hybrid_search import HybridSearch
 
                 searcher = HybridSearch(
                     project.vector_store, graph=project.code_graph
                 )
                 hybrid_result = searcher.search(query, top_k=limit)
-                results = [
-                    {
-                        "node_id": r.node_id,
-                        "hybrid_score": round(r.hybrid_score, 4),
-                        "vector_score": round(r.vector_score, 4),
-                        "graph_score": round(r.graph_score, 4),
-                        "content": r.content[:500],
-                        "relation_type": r.relation_type,
+                results = []
+                for r in hybrid_result.results:
+                    entry = {
+                        "file": r.node_id,
+                        "score": round(r.hybrid_score, 4),
+                        "snippet": r.content[:400],
                     }
-                    for r in hybrid_result.results
-                ]
+                    if include_context and project.code_graph:
+                        related = project.code_graph.get_related_files(
+                            r.node_id, depth=1
+                        )
+                        entry["dependencies"] = related
+                    results.append(entry)
             else:
                 raw = project.vector_store.query(query, n_results=limit)
                 results = []
@@ -164,21 +190,26 @@ class SynapseWrapper:
                         raw["distances"][0] if raw.get("distances") else []
                     )
                     for i, doc in enumerate(docs):
-                        results.append(
-                            {
-                                "node_id": (
-                                    metas[i].get("file_path", "")
-                                    if i < len(metas)
-                                    else ""
-                                ),
-                                "score": (
-                                    round(1 / (1 + dists[i]), 4)
-                                    if i < len(dists)
-                                    else 0
-                                ),
-                                "content": doc[:500],
-                            }
-                        )
+                        entry = {
+                            "file": (
+                                metas[i].get("file_path", "")
+                                if i < len(metas)
+                                else ""
+                            ),
+                            "score": (
+                                round(1 / (1 + dists[i]), 4)
+                                if i < len(dists)
+                                else 0
+                            ),
+                            "snippet": doc[:400],
+                        }
+                        if include_context and project.code_graph:
+                            related = project.code_graph.get_related_files(
+                                entry["file"], depth=1
+                            )
+                            entry["dependencies"] = related
+                        results.append(entry)
+
             return {"query": query, "results": results, "count": len(results)}
 
         return await self._run_sync(_search)
@@ -188,13 +219,18 @@ class SynapseWrapper:
         file: str,
         path: str,
         depth: int = 2,
-        max_files: int = 15,
+        max_files: int = 10,
     ) -> dict:
-        """Build hierarchical context for a file."""
+        """Build dependency-aware reference context for a file.
+
+        Returns skeleton interfaces of related files (imports/imported_by).
+        Does NOT include full source or global context — Claude Code handles those.
+        """
         project_path = validate_project_path(path)
-        if not ensure_initialized(path):
+        if not (project_path / ".synapse").is_dir():
             return {
-                "error": "Project not initialized. Run synapse_init first."
+                "error": "Project not indexed.",
+                "hint": "Run synapse_index first.",
             }
 
         def _context():
@@ -204,187 +240,138 @@ class SynapseWrapper:
                 Path(project_path), depth=depth, max_reference_files=max_files
             )
             result = manager.build_context(Path(file))
+
+            # Parse reference_context into structured entries
+            references = []
+            if result.reference_context:
+                # reference_context is a formatted string with file sections
+                current_file = None
+                current_skeleton = []
+                for line in result.reference_context.split("\n"):
+                    if line.startswith("### "):
+                        if current_file:
+                            references.append(
+                                {
+                                    "file": current_file,
+                                    "skeleton": "\n".join(current_skeleton),
+                                }
+                            )
+                        current_file = line.replace("### ", "").strip()
+                        current_skeleton = []
+                    else:
+                        current_skeleton.append(line)
+                if current_file:
+                    references.append(
+                        {
+                            "file": current_file,
+                            "skeleton": "\n".join(current_skeleton),
+                        }
+                    )
+
             output = {
-                "global_context": result.global_context,
-                "reference_context": result.reference_context,
-                "active_context": result.active_context,
-                "total_tokens": result.total_tokens,
-                "token_breakdown": result.token_breakdown,
-                "included_files": result.included_files,
+                "target_file": file,
+                "references": references,
+                "reference_count": len(references),
             }
+
             if result.savings:
-                output["savings"] = {
-                    "original_tokens": getattr(result.savings, "original_tokens", 0),
-                    "optimized_tokens": getattr(result.savings, "optimized_tokens", 0),
-                    "reduction_ratio": getattr(result.savings, "reduction_ratio", 0),
-                }
+                orig = getattr(result.savings, "original_tokens", 0)
+                opt = getattr(result.savings, "optimized_tokens", 0)
+                ratio = getattr(result.savings, "reduction_ratio", 0)
+                pct = round(ratio * 100) if ratio <= 1 else round(ratio)
+                output["savings"] = f"{orig}\u2192{opt} tokens ({pct}% saved)"
+
             return output
 
         return await self._run_sync(_context)
 
-    async def get_graph(self, file: str, path: str) -> dict:
-        """Get dependency relationships for a file."""
+    async def overview(self, path: str, max_intel_chars: int = 4000) -> dict:
+        """Get project architecture overview.
+
+        Returns INTELLIGENCE.md content, index stats, and file tree.
+        """
         project_path = validate_project_path(path)
-        if not ensure_initialized(path):
+        if not (project_path / ".synapse").is_dir():
             return {
-                "error": "Project not initialized. Run synapse_init first."
+                "error": "Project not indexed.",
+                "hint": "Run synapse_index first.",
             }
 
-        project = self._get_or_create(str(project_path))
+        def _overview():
+            result = {"project_path": str(project_path)}
 
-        def _graph():
-            self._load_stores(project)
-            if project.code_graph is None:
-                return {"error": "Graph not built. Run synapse_analyze first."}
-            related = project.code_graph.get_related_files(file)
-            return {
-                "file": file,
-                "related_files": related,
-                "count": len(related),
-            }
-
-        return await self._run_sync(_graph)
-
-    async def skeletonize(self, file: str) -> dict:
-        """Convert a file to its AST skeleton."""
-        file_path = Path(file).resolve()
-        if not file_path.is_file():
-            return {"error": f"File not found: {file}"}
-
-        def _skeleton():
-            from synapse.structure.pruner import ASTSkeletonizer
-
-            skeletonizer = ASTSkeletonizer()
-            source = file_path.read_text()
-            result = skeletonizer.skeletonize(source)
-            return {
-                "file": str(file_path),
-                "skeleton": result.skeleton,
-                "original_lines": result.original_lines,
-                "skeleton_lines": result.skeleton_lines,
-                "reduction_ratio": result.reduction_ratio,
-            }
-
-        return await self._run_sync(_skeleton)
-
-    async def ask(self, query: str, path: str, think: bool = False) -> dict:
-        """Generate an AI prompt with relevant context."""
-        project_path = validate_project_path(path)
-        if not ensure_initialized(path):
-            return {
-                "error": "Project not initialized. Run synapse_init first."
-            }
-
-        project = self._get_or_create(str(project_path))
-
-        def _ask():
-            self._load_stores(project)
-            from synapse.hybrid_search import HybridSearch
-
-            # Search for relevant files
-            if project.code_graph is not None:
-                searcher = HybridSearch(
-                    project.vector_store, graph=project.code_graph
-                )
-                hybrid_result = searcher.search(query, top_k=5)
-                results = hybrid_result.results
-                relevant_files = [r.node_id for r in results]
+            # INTELLIGENCE.md
+            intel_path = project_path / ".context" / "INTELLIGENCE.md"
+            if intel_path.exists():
+                content = intel_path.read_text()
+                if len(content) > max_intel_chars:
+                    result["intelligence"] = content[:max_intel_chars] + "\n\n... (truncated)"
+                    result["intelligence_truncated"] = True
+                else:
+                    result["intelligence"] = content
             else:
-                raw = project.vector_store.query(query, n_results=5)
-                results = []
-                relevant_files = []
-                if raw and raw.get("documents"):
-                    metas = (
-                        raw["metadatas"][0] if raw.get("metadatas") else []
-                    )
-                    relevant_files = [
-                        m.get("file_path", "") for m in metas
-                    ]
+                result["intelligence"] = None
 
-            # Build context from top result
-            context_text = ""
-            if relevant_files and relevant_files[0]:
-                try:
-                    from synapse.context_manager import ContextManager
+            # Index stats from file_hashes.json
+            hashes_path = project_path / ".synapse" / "file_hashes.json"
+            if hashes_path.exists():
+                hashes = json_mod.loads(hashes_path.read_text())
+                files_data = hashes.get("files", hashes)
+                result["indexed_files"] = len(files_data)
 
-                    manager = ContextManager(
-                        Path(project_path), depth=1, max_reference_files=10
-                    )
-                    ctx = manager.build_context(Path(relevant_files[0]))
-                    context_text = ctx.formatted_output
-                except Exception:
-                    # Fallback to search snippets
-                    if hasattr(results[0], "content"):
-                        context_text = "\n\n".join(
-                            r.content[:500] for r in results[:3]
-                        )
+            # Graph stats
+            graph_path = project_path / ".synapse" / "dependency_graph.gml"
+            if graph_path.exists():
+                from synapse.graph import CodeGraph
 
-            # Build prompt
-            think_prefix = (
-                "Think step by step before answering.\n\n" if think else ""
-            )
-            prompt = (
-                f"{think_prefix}"
-                f"## Context\n\n{context_text}\n\n"
-                f"## Question\n\n{query}"
-            )
+                g = CodeGraph(storage_path=graph_path)
+                g.load()
+                if hasattr(g, "graph"):
+                    result["graph_nodes"] = g.graph.number_of_nodes()
+                    result["graph_edges"] = g.graph.number_of_edges()
 
-            return {
-                "prompt": prompt,
-                "relevant_files": relevant_files,
-                "token_estimate": len(prompt) // 4,
-            }
+            # File tree (3 levels)
+            result["file_tree"] = self._build_file_tree(project_path, max_depth=3)
 
-        return await self._run_sync(_ask)
+            return result
 
-    async def watch(self, action: str, path: str) -> dict:
-        """Manage file watcher (start/stop/status)."""
-        project_path = validate_project_path(path)
-        if not ensure_initialized(path):
-            return {
-                "error": "Project not initialized. Run synapse_init first."
-            }
+        return await self._run_sync(_overview)
 
-        def _watch():
-            from synapse.watcher import SynapseWatcher
+    def _build_file_tree(
+        self, root: Path, max_depth: int = 3, _depth: int = 0
+    ) -> str:
+        """Build a simple file tree string (3 levels max)."""
+        if _depth >= max_depth:
+            return ""
 
-            if action == "status":
-                return SynapseWatcher.get_status(str(project_path))
-            elif action == "start":
-                watcher = SynapseWatcher(str(project_path))
-                watcher.start()
-                return {
-                    "status": "started",
-                    "message": f"Watcher started for {project_path}",
-                }
-            elif action == "stop":
-                import os
-                import signal
+        skip_dirs = {
+            ".git", ".synapse", ".context", ".agent",
+            "__pycache__", "node_modules", ".venv", "venv",
+            ".tox", ".mypy_cache", ".pytest_cache",
+        }
 
-                status = SynapseWatcher.get_status(str(project_path))
-                pid = status.get("pid")
-                if pid:
-                    try:
-                        os.kill(pid, signal.SIGTERM)
-                        return {
-                            "status": "stopped",
-                            "message": f"Watcher (PID {pid}) stopped",
-                        }
-                    except ProcessLookupError:
-                        return {
-                            "status": "not_running",
-                            "message": "Watcher process not found",
-                        }
-                return {
-                    "status": "not_running",
-                    "message": "No watcher is running",
-                }
+        lines = []
+        try:
+            entries = sorted(root.iterdir(), key=lambda e: (not e.is_dir(), e.name))
+        except PermissionError:
+            return ""
+
+        for entry in entries:
+            if entry.name.startswith(".") and entry.name in skip_dirs:
+                continue
+            if entry.name in skip_dirs:
+                continue
+
+            prefix = "  " * _depth
+            if entry.is_dir():
+                lines.append(f"{prefix}{entry.name}/")
+                sub = self._build_file_tree(entry, max_depth, _depth + 1)
+                if sub:
+                    lines.append(sub)
             else:
-                return {
-                    "error": f"Unknown action: {action}. Use start/stop/status."
-                }
+                lines.append(f"{prefix}{entry.name}")
 
-        return await self._run_sync(_watch)
+        return "\n".join(lines)
 
     async def cleanup(self):
         """Shutdown the thread pool executor."""
