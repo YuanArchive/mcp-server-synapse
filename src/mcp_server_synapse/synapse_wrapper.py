@@ -7,6 +7,7 @@ import json as json_mod
 import os
 import sys
 import time
+import types
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import redirect_stdout
 from dataclasses import dataclass, field
@@ -47,6 +48,19 @@ class SynapseWrapper:
         self._keep_vector_store_loaded = self._read_bool_env(
             "SYNAPSE_KEEP_VECTOR_STORE_LOADED", default=False
         )
+        self._pretruncate_chars = self._read_int_env(
+            "SYNAPSE_PRETRUNCATE_CHARS", default=2500, minimum=1
+        )
+        self._max_symbol_chars = self._read_int_env(
+            "SYNAPSE_MAX_SYMBOL_CHARS", default=1200, minimum=1
+        )
+        self._max_symbols_per_file = self._read_int_env(
+            "SYNAPSE_MAX_SYMBOLS_PER_FILE", default=80, minimum=0
+        )
+        self._force_cpu_embeddings = self._read_bool_env(
+            "SYNAPSE_FORCE_CPU_EMBEDDINGS", default=True
+        )
+        self._configure_runtime_limits()
 
     async def _run_sync(self, func, *args, **kwargs):
         """Run a sync function in the thread pool executor."""
@@ -91,6 +105,28 @@ class SynapseWrapper:
         if not raw:
             return []
         return [item.strip() for item in raw.split(",") if item.strip()]
+
+    def _configure_runtime_limits(self) -> None:
+        """Apply conservative runtime defaults to reduce peak memory usage."""
+        os.environ.setdefault("SYNAPSE_BATCH_SIZE", "2")
+        os.environ.setdefault(
+            "SYNAPSE_MAX_DOC_CHARS", str(self._pretruncate_chars)
+        )
+        os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+        os.environ.setdefault("OMP_NUM_THREADS", "1")
+        os.environ.setdefault("MKL_NUM_THREADS", "1")
+
+        if not self._force_cpu_embeddings:
+            return
+
+        try:
+            import torch
+
+            mps_backend = getattr(torch.backends, "mps", None)
+            if mps_backend is not None and hasattr(mps_backend, "is_available"):
+                mps_backend.is_available = lambda: False
+        except Exception:
+            pass
 
     def _load_ignore_patterns(self, project_path: Path) -> list[str]:
         """Load indexing ignore patterns from file + env vars."""
@@ -237,6 +273,103 @@ class SynapseWrapper:
             "hint": "Use .synapseignore or env: SYNAPSE_IGNORE_PATTERNS,SYNAPSE_EXTRA_EXCLUDE_DIRS",
         }
 
+    def _build_memory_metadata(self) -> dict:
+        """Expose active memory controls for diagnostics."""
+        return {
+            "index_workers": self._index_workers,
+            "force_cpu_embeddings": self._force_cpu_embeddings,
+            "pretruncate_chars": self._pretruncate_chars,
+            "max_symbol_chars": self._max_symbol_chars,
+            "max_symbols_per_file": self._max_symbols_per_file,
+            "batch_size": os.getenv("SYNAPSE_BATCH_SIZE"),
+            "max_doc_chars": os.getenv("SYNAPSE_MAX_DOC_CHARS"),
+        }
+
+    def _apply_low_memory_doc_limits(self, analyzer: object) -> None:
+        """Patch analyzer aggregation to cap in-memory payload size."""
+        if getattr(analyzer, "_synapse_low_memory_wrapped", False):
+            return
+        if not hasattr(analyzer, "_aggregate_results"):
+            return
+
+        original_aggregate_results = analyzer._aggregate_results
+
+        def _aggregate_with_limits(
+            this,
+            file_path: Path,
+            result: dict,
+            content: str,
+            documents: list,
+            metadatas: list,
+            ids: list,
+        ):
+            bounded_content = content
+            if (
+                isinstance(bounded_content, str)
+                and self._pretruncate_chars > 0
+                and len(bounded_content) > self._pretruncate_chars
+            ):
+                bounded_content = bounded_content[: self._pretruncate_chars]
+
+            bounded_result = result
+            symbols = (
+                result.get("symbols", [])
+                if isinstance(result, dict)
+                else []
+            )
+            if symbols:
+                bounded_symbols = symbols
+                changed = False
+
+                if (
+                    self._max_symbols_per_file >= 0
+                    and len(bounded_symbols) > self._max_symbols_per_file
+                ):
+                    bounded_symbols = bounded_symbols[
+                        : self._max_symbols_per_file
+                    ]
+                    changed = True
+
+                if self._max_symbol_chars > 0:
+                    rewritten = []
+                    for symbol in bounded_symbols:
+                        if not isinstance(symbol, dict):
+                            rewritten.append(symbol)
+                            continue
+
+                        symbol_code = symbol.get("code")
+                        if (
+                            isinstance(symbol_code, str)
+                            and len(symbol_code) > self._max_symbol_chars
+                        ):
+                            compact_symbol = dict(symbol)
+                            compact_symbol["code"] = symbol_code[
+                                : self._max_symbol_chars
+                            ]
+                            rewritten.append(compact_symbol)
+                            changed = True
+                        else:
+                            rewritten.append(symbol)
+                    bounded_symbols = rewritten
+
+                if changed:
+                    bounded_result = dict(result)
+                    bounded_result["symbols"] = bounded_symbols
+
+            return original_aggregate_results(
+                file_path,
+                bounded_result,
+                bounded_content,
+                documents,
+                metadatas,
+                ids,
+            )
+
+        analyzer._aggregate_results = types.MethodType(
+            _aggregate_with_limits, analyzer
+        )
+        analyzer._synapse_low_memory_wrapped = True
+
     def _collect_memory(self) -> None:
         """Run best-effort memory cleanup for Python and torch allocators."""
         if not self._aggressive_cleanup:
@@ -377,6 +510,7 @@ class SynapseWrapper:
             is_fresh = self._ensure_initialized(project_path)
             analyzer = self._get_analyzer(project)
             ignore_patterns = self._apply_index_filters(analyzer, project_path)
+            self._apply_low_memory_doc_limits(analyzer)
 
             if full or is_fresh:
                 result = analyzer.analyze(
@@ -437,6 +571,7 @@ class SynapseWrapper:
                 "ignore": self._build_ignore_metadata(
                     project_path, ignore_patterns
                 ),
+                "memory": self._build_memory_metadata(),
             }
             return output
 

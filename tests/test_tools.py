@@ -1,6 +1,7 @@
 """Tests for synapse MCP server tools."""
 
 import json
+import os
 import pytest
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -340,7 +341,70 @@ class TestSynapseWrapper:
         assert result["ignore"]["pattern_count"] == 2
         assert result["ignore"]["patterns_preview"] == ["logs/", "*.log"]
         assert "ignore_file" in result["ignore"]
+        assert "memory" in result
+        assert result["memory"]["index_workers"] == local_wrapper._index_workers
         local_wrapper._executor.shutdown(wait=False)
+
+    def test_configure_runtime_limits_defaults(self, monkeypatch):
+        monkeypatch.delenv("SYNAPSE_BATCH_SIZE", raising=False)
+        monkeypatch.delenv("SYNAPSE_MAX_DOC_CHARS", raising=False)
+        monkeypatch.delenv("TOKENIZERS_PARALLELISM", raising=False)
+        monkeypatch.delenv("OMP_NUM_THREADS", raising=False)
+        monkeypatch.delenv("MKL_NUM_THREADS", raising=False)
+
+        wrapper = SynapseWrapper()
+        assert os.getenv("SYNAPSE_BATCH_SIZE") == "2"
+        assert os.getenv("SYNAPSE_MAX_DOC_CHARS") is not None
+        assert os.getenv("TOKENIZERS_PARALLELISM") == "false"
+        assert os.getenv("OMP_NUM_THREADS") == "1"
+        assert os.getenv("MKL_NUM_THREADS") == "1"
+        wrapper._executor.shutdown(wait=False)
+
+    def test_apply_low_memory_doc_limits_truncates_payload(
+        self, monkeypatch, tmp_path
+    ):
+        monkeypatch.setenv("SYNAPSE_PRETRUNCATE_CHARS", "10")
+        monkeypatch.setenv("SYNAPSE_MAX_SYMBOL_CHARS", "5")
+        monkeypatch.setenv("SYNAPSE_MAX_SYMBOLS_PER_FILE", "1")
+
+        wrapper = SynapseWrapper()
+        captured = {}
+
+        class FakeAnalyzer:
+            def _aggregate_results(
+                self,
+                file_path,
+                result,
+                content,
+                documents,
+                metadatas,
+                ids,
+            ):
+                captured["content"] = content
+                captured["result"] = result
+                return None
+
+        analyzer = FakeAnalyzer()
+        wrapper._apply_low_memory_doc_limits(analyzer)
+
+        analyzer._aggregate_results(
+            tmp_path / "a.py",
+            {
+                "symbols": [
+                    {"name": "alpha", "code": "1234567890"},
+                    {"name": "beta", "code": "zzzzzz"},
+                ]
+            },
+            "abcdefghijklm",
+            [],
+            [],
+            [],
+        )
+
+        assert captured["content"] == "abcdefghij"
+        assert len(captured["result"]["symbols"]) == 1
+        assert captured["result"]["symbols"][0]["code"] == "12345"
+        wrapper._executor.shutdown(wait=False)
 
 
 class TestFileTree:

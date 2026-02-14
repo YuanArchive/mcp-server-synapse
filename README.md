@@ -179,6 +179,10 @@ Measured on a real 18-file project:
 | `SYNAPSE_CACHE_TTL_SECONDS` | `600` | Idle time before cached project memory is evicted |
 | `SYNAPSE_KEEP_VECTOR_STORE_LOADED` | `0` | Keep embedding model in RAM after indexing (`1` = faster follow-up search, higher RAM) |
 | `SYNAPSE_AGGRESSIVE_CLEANUP` | `1` | Run `gc` + torch cache cleanup after evictions/indexing |
+| `SYNAPSE_FORCE_CPU_EMBEDDINGS` | `1` | Force CPU embeddings to avoid large MPS unified-memory spikes |
+| `SYNAPSE_PRETRUNCATE_CHARS` | `2500` | Truncate file payload before analyzer appends to in-memory documents |
+| `SYNAPSE_MAX_SYMBOL_CHARS` | `1200` | Truncate symbol code payload before indexing |
+| `SYNAPSE_MAX_SYMBOLS_PER_FILE` | `80` | Cap symbol entries indexed per file (`0` = disable symbol indexing) |
 | `SYNAPSE_EXTRA_EXCLUDE_DIRS` | `` | Extra directory names to skip (comma-separated, e.g. `dist,coverage`) |
 | `SYNAPSE_IGNORE_PATTERNS` | `` | Extra ignore patterns (comma-separated, e.g. `generated/,*.min.js`) |
 | `SYNAPSE_IGNORE_FILE` | `.synapseignore` | Ignore-pattern file name/path (absolute or project-relative) |
@@ -190,6 +194,10 @@ export SYNAPSE_INDEX_WORKERS=1
 export SYNAPSE_MAX_CACHED_PROJECTS=1
 export SYNAPSE_CACHE_TTL_SECONDS=300
 export SYNAPSE_KEEP_VECTOR_STORE_LOADED=0
+export SYNAPSE_FORCE_CPU_EMBEDDINGS=1
+export SYNAPSE_PRETRUNCATE_CHARS=2000
+export SYNAPSE_MAX_SYMBOL_CHARS=800
+export SYNAPSE_MAX_SYMBOLS_PER_FILE=40
 ```
 
 Noise filtering for indexing:
