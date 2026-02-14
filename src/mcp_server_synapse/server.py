@@ -38,7 +38,9 @@ async def synapse_index(
     project_path: str, full: bool = False, ctx: Context = None
 ) -> str:
     """Index codebase for semantic search. Auto-initializes on first run, generates INTELLIGENCE.md.
-    Use after cloning or major code changes. Incremental by default."""
+    Use after cloning or major code changes. Incremental by default.
+    Noise control: configure `.synapseignore` (or env `SYNAPSE_IGNORE_PATTERNS` / `SYNAPSE_EXTRA_EXCLUDE_DIRS`) before indexing.
+    If ignore rules changed, run with `full=true` to rebuild a clean index."""
     wrapper = _get_wrapper(ctx)
     await ctx.report_progress(0, 100)
     result = await wrapper.index(project_path, full=full)

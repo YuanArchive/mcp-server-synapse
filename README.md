@@ -60,6 +60,7 @@ That's it. Claude Code will automatically call the right tools.
 ### `synapse_index`
 
 Index codebase for semantic search. Auto-initializes on first run, generates INTELLIGENCE.md.
+Response includes `ignore` metadata so AI agents can verify which noise filters were applied.
 
 ```
 project_path  (str)  — Absolute path to the project
@@ -178,6 +179,9 @@ Measured on a real 18-file project:
 | `SYNAPSE_CACHE_TTL_SECONDS` | `600` | Idle time before cached project memory is evicted |
 | `SYNAPSE_KEEP_VECTOR_STORE_LOADED` | `0` | Keep embedding model in RAM after indexing (`1` = faster follow-up search, higher RAM) |
 | `SYNAPSE_AGGRESSIVE_CLEANUP` | `1` | Run `gc` + torch cache cleanup after evictions/indexing |
+| `SYNAPSE_EXTRA_EXCLUDE_DIRS` | `` | Extra directory names to skip (comma-separated, e.g. `dist,coverage`) |
+| `SYNAPSE_IGNORE_PATTERNS` | `` | Extra ignore patterns (comma-separated, e.g. `generated/,*.min.js`) |
+| `SYNAPSE_IGNORE_FILE` | `.synapseignore` | Ignore-pattern file name/path (absolute or project-relative) |
 
 Recommended low-memory profile (target under ~20GB on large repos):
 
@@ -186,6 +190,26 @@ export SYNAPSE_INDEX_WORKERS=1
 export SYNAPSE_MAX_CACHED_PROJECTS=1
 export SYNAPSE_CACHE_TTL_SECONDS=300
 export SYNAPSE_KEEP_VECTOR_STORE_LOADED=0
+```
+
+Noise filtering for indexing:
+
+```bash
+# optional env overrides
+export SYNAPSE_EXTRA_EXCLUDE_DIRS=dist,coverage,artifacts
+export SYNAPSE_IGNORE_PATTERNS='generated/,*.min.js,**/*.snapshot.ts'
+```
+
+Create a `.synapseignore` file in your project root:
+
+```gitignore
+# folders
+generated/
+coverage/
+
+# files
+*.min.js
+*.generated.ts
 ```
 
 ## Requirements

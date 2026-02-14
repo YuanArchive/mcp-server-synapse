@@ -1,6 +1,7 @@
 """Async wrapper around synapse-ai-context modules."""
 
 import asyncio
+import fnmatch
 import gc
 import json as json_mod
 import os
@@ -82,6 +83,159 @@ class SynapseWrapper:
         if value in {"0", "false", "no", "off"}:
             return False
         return default
+
+    @staticmethod
+    def _read_csv_env(name: str) -> list[str]:
+        """Read comma-separated env var values, stripping blanks."""
+        raw = os.getenv(name, "")
+        if not raw:
+            return []
+        return [item.strip() for item in raw.split(",") if item.strip()]
+
+    def _load_ignore_patterns(self, project_path: Path) -> list[str]:
+        """Load indexing ignore patterns from file + env vars."""
+        patterns: list[str] = []
+
+        ignore_file_name = os.getenv("SYNAPSE_IGNORE_FILE", ".synapseignore").strip()
+        if ignore_file_name:
+            ignore_file_path = Path(ignore_file_name)
+            if not ignore_file_path.is_absolute():
+                ignore_file_path = project_path / ignore_file_path
+            if ignore_file_path.is_file():
+                for line in ignore_file_path.read_text(
+                    encoding="utf-8", errors="replace"
+                ).splitlines():
+                    stripped = line.strip()
+                    if not stripped or stripped.startswith("#"):
+                        continue
+                    patterns.append(stripped)
+
+        patterns.extend(self._read_csv_env("SYNAPSE_IGNORE_PATTERNS"))
+
+        # Dedupe while preserving order
+        unique_patterns: list[str] = []
+        seen = set()
+        for pattern in patterns:
+            if pattern in seen:
+                continue
+            seen.add(pattern)
+            unique_patterns.append(pattern)
+        return unique_patterns
+
+    def _is_ignored_file(
+        self, file_path: Path, project_path: Path, patterns: list[str]
+    ) -> bool:
+        """Check whether a file should be excluded from indexing."""
+        try:
+            rel_path = file_path.resolve().relative_to(project_path.resolve()).as_posix()
+        except ValueError:
+            rel_path = file_path.resolve().as_posix()
+
+        parts = rel_path.split("/")
+        filename = parts[-1] if parts else rel_path
+
+        for raw_pattern in patterns:
+            pattern = raw_pattern.strip()
+            if not pattern or pattern.startswith("#"):
+                continue
+            if pattern.startswith("!"):
+                # Negation is currently not supported.
+                continue
+
+            pattern = pattern.removeprefix("./")
+            is_dir_pattern = pattern.endswith("/")
+            core_pattern = pattern.rstrip("/")
+            if not core_pattern:
+                continue
+
+            if is_dir_pattern:
+                if "/" in core_pattern:
+                    anchored = core_pattern.lstrip("/")
+                    if rel_path == anchored or rel_path.startswith(anchored + "/"):
+                        return True
+                    if fnmatch.fnmatch(rel_path, f"**/{anchored}/**"):
+                        return True
+                else:
+                    if any(fnmatch.fnmatch(part, core_pattern) for part in parts[:-1]):
+                        return True
+                continue
+
+            if "/" in core_pattern:
+                anchored = core_pattern.lstrip("/")
+                if fnmatch.fnmatch(rel_path, anchored):
+                    return True
+                if fnmatch.fnmatch(rel_path, f"**/{anchored}"):
+                    return True
+            elif fnmatch.fnmatch(filename, core_pattern):
+                return True
+
+        return False
+
+    def _apply_index_filters(self, analyzer: object, project_path: Path) -> list[str]:
+        """Apply directory/file ignore filters to analyzer.scan_files."""
+        extra_exclude_dirs = self._read_csv_env("SYNAPSE_EXTRA_EXCLUDE_DIRS")
+        ignore_patterns = self._load_ignore_patterns(project_path)
+
+        if hasattr(analyzer, "exclude_dirs"):
+            for value in extra_exclude_dirs:
+                cleaned = value.strip().strip("/")
+                if not cleaned:
+                    continue
+                ignore_patterns.append(f"{cleaned}/")
+                # Analyzer exclude_dirs matches by path.parts, so only simple names apply.
+                if "/" not in cleaned and cleaned not in analyzer.exclude_dirs:
+                    analyzer.exclude_dirs.append(cleaned)
+
+        # Dedupe merged patterns
+        merged_patterns: list[str] = []
+        seen = set()
+        for pattern in ignore_patterns:
+            if pattern in seen:
+                continue
+            seen.add(pattern)
+            merged_patterns.append(pattern)
+
+        if not getattr(analyzer, "_synapse_ignore_wrapped", False):
+            original_scan_files = analyzer.scan_files
+
+            def _scan_files_with_ignores(*args, **kwargs):
+                files = original_scan_files(*args, **kwargs)
+                active_patterns = getattr(analyzer, "_synapse_ignore_patterns", [])
+                if not active_patterns:
+                    return files
+                return [
+                    file_path
+                    for file_path in files
+                    if not self._is_ignored_file(
+                        file_path, project_path, active_patterns
+                    )
+                ]
+
+            analyzer.scan_files = _scan_files_with_ignores
+            analyzer._synapse_ignore_wrapped = True
+
+        analyzer._synapse_ignore_patterns = merged_patterns
+        return merged_patterns
+
+    def _build_ignore_metadata(
+        self, project_path: Path, ignore_patterns: list[str]
+    ) -> dict:
+        """Build compact ignore-config metadata for tool consumers."""
+        ignore_file_name = os.getenv("SYNAPSE_IGNORE_FILE", ".synapseignore").strip()
+        if not ignore_file_name:
+            ignore_file_name = ".synapseignore"
+
+        ignore_file_path = Path(ignore_file_name)
+        if not ignore_file_path.is_absolute():
+            ignore_file_path = project_path / ignore_file_path
+
+        return {
+            "pattern_count": len(ignore_patterns),
+            "patterns_preview": ignore_patterns[:8],
+            "ignore_file": str(ignore_file_path),
+            "ignore_file_exists": ignore_file_path.is_file(),
+            "hint": "Use .synapseignore or env: SYNAPSE_IGNORE_PATTERNS,SYNAPSE_EXTRA_EXCLUDE_DIRS",
+        }
 
     def _collect_memory(self) -> None:
         """Run best-effort memory cleanup for Python and torch allocators."""
@@ -222,6 +376,7 @@ class SynapseWrapper:
         def _index():
             is_fresh = self._ensure_initialized(project_path)
             analyzer = self._get_analyzer(project)
+            ignore_patterns = self._apply_index_filters(analyzer, project_path)
 
             if full or is_fresh:
                 result = analyzer.analyze(
@@ -279,6 +434,9 @@ class SynapseWrapper:
                 "graph_nodes": result.get("graph_nodes", 0),
                 "graph_edges": result.get("graph_edges", 0),
                 "is_fresh_index": is_fresh,
+                "ignore": self._build_ignore_metadata(
+                    project_path, ignore_patterns
+                ),
             }
             return output
 
