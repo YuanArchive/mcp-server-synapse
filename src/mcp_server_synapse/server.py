@@ -92,6 +92,56 @@ async def synapse_context(
     return _json(result)
 
 
+@mcp.tool()
+@synapse_error_handler
+async def synapse_graph(
+    file_path: str, project_path: str, ctx: Context = None
+) -> str:
+    """Dependency graph for a file: what it calls and what calls it.
+    Use before refactoring to understand impact. For code search use synapse_search."""
+    wrapper = _get_wrapper(ctx)
+    result = await wrapper.graph(file_path, project_path)
+    return _json(result)
+
+
+@mcp.tool()
+@synapse_error_handler
+async def synapse_skeleton(file_path: str, ctx: Context = None) -> str:
+    """Skeletonize a file: keep signatures and docstrings, replace bodies with '...'.
+    Use to understand a file's API without reading full source. For dependencies use synapse_context."""
+    wrapper = _get_wrapper(ctx)
+    result = await wrapper.skeleton(file_path)
+    return _json(result)
+
+
+@mcp.tool()
+@synapse_error_handler
+async def synapse_ask(
+    query: str,
+    project_path: str,
+    limit: int = 5,
+    think: bool = False,
+    ctx: Context = None,
+) -> str:
+    """Generate context-enriched prompt via vector search + graph expansion.
+    Set think=true for Deep Think mode (Chain-of-Thought). For simple search use synapse_search."""
+    wrapper = _get_wrapper(ctx)
+    result = await wrapper.ask(query, project_path, limit=limit, think=think)
+    return _json(result)
+
+
+@mcp.tool()
+@synapse_error_handler
+async def synapse_watch_status(
+    project_path: str, ctx: Context = None
+) -> str:
+    """Check file watcher daemon status for a project.
+    Shows if background indexing is running. Start/stop watcher via CLI."""
+    wrapper = _get_wrapper(ctx)
+    result = await wrapper.watch_status(project_path)
+    return _json(result)
+
+
 def main():
     """Entry point for the MCP server."""
     mcp.run()

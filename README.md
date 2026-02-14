@@ -55,7 +55,7 @@ That's it. Claude Code will automatically call the right tools.
 
 ## Tools
 
-4 tools, designed to minimize token usage while maximizing information density.
+8 tools, designed to minimize token usage while maximizing information density.
 
 ### `synapse_index`
 
@@ -94,6 +94,42 @@ file_path     (str) — Target file path
 project_path  (str) — Absolute path to the project
 depth         (int) — BFS traversal depth (default: 2)
 max_files     (int) — Max related files (default: 10)
+```
+
+### `synapse_graph`
+
+Dependency graph for a file: what it calls and what calls it.
+
+```
+file_path     (str) — Target file path
+project_path  (str) — Absolute path to the project
+```
+
+### `synapse_skeleton`
+
+Skeletonize a file: keep signatures and docstrings, replace bodies with `...`.
+
+```
+file_path     (str) — Target file path (absolute)
+```
+
+### `synapse_ask`
+
+Generate context-enriched prompt via vector search + graph expansion.
+
+```
+query         (str)  — Natural language question
+project_path  (str)  — Absolute path to the project
+limit         (int)  — Max context results (default: 5)
+think         (bool) — Enable Deep Think mode with Chain-of-Thought (default: false)
+```
+
+### `synapse_watch_status`
+
+Check file watcher daemon status for a project.
+
+```
+project_path  (str)  — Absolute path to the project
 ```
 
 ---
@@ -137,6 +173,20 @@ Measured on a real 18-file project:
 |:---------|:--------|:------------|
 | `SYNAPSE_BATCH_SIZE` | `6` | ChromaDB upsert batch size |
 | `SYNAPSE_MAX_DOC_CHARS` | `8000` | Max document characters for embedding |
+| `SYNAPSE_INDEX_WORKERS` | `2` | Max worker processes for indexing (lower = less peak RAM) |
+| `SYNAPSE_MAX_CACHED_PROJECTS` | `1` | Number of project runtimes cached in memory |
+| `SYNAPSE_CACHE_TTL_SECONDS` | `600` | Idle time before cached project memory is evicted |
+| `SYNAPSE_KEEP_VECTOR_STORE_LOADED` | `0` | Keep embedding model in RAM after indexing (`1` = faster follow-up search, higher RAM) |
+| `SYNAPSE_AGGRESSIVE_CLEANUP` | `1` | Run `gc` + torch cache cleanup after evictions/indexing |
+
+Recommended low-memory profile (target under ~20GB on large repos):
+
+```bash
+export SYNAPSE_INDEX_WORKERS=1
+export SYNAPSE_MAX_CACHED_PROJECTS=1
+export SYNAPSE_CACHE_TTL_SECONDS=300
+export SYNAPSE_KEEP_VECTOR_STORE_LOADED=0
+```
 
 ## Requirements
 

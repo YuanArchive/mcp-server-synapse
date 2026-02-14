@@ -3,7 +3,7 @@
 import json
 import pytest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from mcp_server_synapse.utils import validate_project_path, format_error
 from mcp_server_synapse.synapse_wrapper import SynapseWrapper
@@ -194,6 +194,55 @@ class TestSynapseWrapper:
     async def test_cleanup(self, wrapper):
         await wrapper.cleanup()
         assert len(wrapper._cache) == 0
+
+    def test_get_or_create_lazy_analyzer(self, wrapper, tmp_path):
+        project = wrapper._get_or_create(str(tmp_path))
+        assert project.analyzer is None
+
+    def test_cache_limit_evicts_old_project(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("SYNAPSE_MAX_CACHED_PROJECTS", "1")
+
+        project_a = tmp_path / "project_a"
+        project_b = tmp_path / "project_b"
+        project_a.mkdir()
+        project_b.mkdir()
+
+        local_wrapper = SynapseWrapper()
+        local_wrapper._get_or_create(str(project_a))
+        local_wrapper._get_or_create(str(project_b))
+
+        assert len(local_wrapper._cache) == 1
+        assert str(project_b.resolve()) in local_wrapper._cache
+        assert str(project_a.resolve()) not in local_wrapper._cache
+        local_wrapper._executor.shutdown(wait=False)
+
+    @pytest.mark.asyncio
+    async def test_index_respects_index_worker_setting(
+        self, monkeypatch, tmp_path
+    ):
+        monkeypatch.setenv("SYNAPSE_INDEX_WORKERS", "3")
+
+        local_wrapper = SynapseWrapper()
+        fake_analyzer = MagicMock()
+        fake_analyzer.analyze.return_value = {
+            "status": "success",
+            "files_analyzed": 1,
+            "graph_nodes": 0,
+            "graph_edges": 0,
+        }
+        fake_analyzer.code_graph = None
+        fake_analyzer.vector_store = None
+
+        with patch.object(
+            local_wrapper, "_get_analyzer", return_value=fake_analyzer
+        ), patch.object(local_wrapper, "_ensure_initialized", return_value=True):
+            result = await local_wrapper.index(str(tmp_path), full=True)
+
+        fake_analyzer.analyze.assert_called_once_with(
+            json_output=True, num_workers=3
+        )
+        assert result["status"] == "success"
+        local_wrapper._executor.shutdown(wait=False)
 
 
 class TestFileTree:

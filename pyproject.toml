@@ -5,7 +5,7 @@ description = "MCP server for synapse-ai-context"
 requires-python = ">=3.10,<3.13"
 dependencies = [
     "mcp[cli]>=1.0.0",
-    "synapse-tool @ git+https://github.com/YuanArchive/synapse-ai-context.git",
+    "synapse-tool @ git+https://github.com/YuanArchive/synapse-ai-context.git@137cf533df0021d72a26aee7c52ad47d66ee64b8",
 ]
 
 [project.scripts]
